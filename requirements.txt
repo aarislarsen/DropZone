@@ -1,0 +1,12 @@
+# FileDrop — Python dependencies
+# Python 3.11+ required
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# For Docker:
+#   FROM python:3.11-slim
+#   COPY requirements.txt .
+#   RUN pip install --no-cache-dir -r requirements.txt
+
+aiohttp[speedups]>=3.9.5,<4.0
