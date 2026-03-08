@@ -1,73 +1,54 @@
 /**
- * FileDrop — client application
+ * DropZone — client application
  *
  * Cryptographic design:
  *
  *  1. Creator visits page → clicks "New Session"
  *     - Server responds with session_id + salt (random 32 bytes)
- *     - Creator is shown the full 48-emoji pool and picks 4 in order
- *     - Browser derives:  ikm = PBKDF2(emoji_string, salt, 200_000, SHA-256, 32)
- *     - Browser generates: ephemeral P-256 ECDH keypair (creator_priv, creator_pub)
- *     - Sends creator_pub (raw, hex) to server via "set-ecdh-pub"
- *     - Join window opens on server (60 s default)
+ *     - Creator enters a passphrase (20+ characters)
+ *     - Browser derives:  ikm      = PBKDF2-SHA256(passphrase_utf8, salt, 200_000, 256-bit)
+ *     - Browser derives:  groupKey = HKDF-SHA256(ikm, salt=0, info="filedrop-group-v1")
+ *     - Browser generates a random 32-byte session token (myECDHPubHex) for rejoin auth
+ *     - Sends token to server via "set-ecdh-pub"; server opens the 60 s join window
  *
  *  2. Joiner visits page → sees session in lobby → clicks Join
- *     - Server sends back: salt + creator_pub
- *     - Joiner is shown the emoji grid and must enter the same 4 in order
- *     - Browser derives:  ikm = PBKDF2(emoji_string, salt, 200_000, SHA-256, 32)
- *     - Browser generates: ephemeral P-256 ECDH keypair (joiner_priv, joiner_pub)
- *     - Browser computes:  ecdh_secret = ECDH(joiner_priv, creator_pub)
- *     - session_key = HKDF-SHA256(ecdh_secret, ikm, "filedrop-text-v1", 256-bit)
- *     - Sends joiner_pub to server via "join-session" → server relays to creator
+ *     - Server sends back: salt
+ *     - Joiner enters the same passphrase
+ *     - Browser derives ikm + groupKey identically (same passphrase → same key)
+ *     - Browser generates a random session token and sends via "join-session"
  *
- *  3. Creator receives joiner_pub
- *     - Browser computes:  ecdh_secret = ECDH(creator_priv, joiner_pub)
- *     - session_key = HKDF-SHA256(ecdh_secret, ikm, "filedrop-text-v1", 256-bit)
- *     - Both sides now hold the same session_key — server never sees it
- *
- *  4. Text-share: AES-256-GCM(session_key, random_iv, plaintext)
+ *  3. Text-share: AES-256-GCM(groupKey, random_iv, plaintext)
  *     - Server relays ciphertext + iv as opaque base64 blobs
- *     - Forward secrecy: ephemeral ECDH keys are discarded after derivation;
- *       compromising the emoji later cannot decrypt past sessions
+ *     - All peers hold the same groupKey → any peer can decrypt any other's messages
+ *     - groupKey is never transmitted; passphrase is never transmitted
  *
- *  5. File transfer: WebRTC DataChannel (DTLS 1.2+ with ephemeral ECDHE)
+ *  4. File transfer: WebRTC DataChannel (DTLS 1.2+ with ephemeral ECDHE)
  *     - DTLS provides forward secrecy at the transport layer
- *     - No additional application-layer encryption on data channels needed
+ *     - Fallback: if WebRTC fails (connectionState = 'failed'), chunks are relayed
+ *       base64-encoded through the signalling server in 32 KB pieces
  *
- * Passphrase entropy: a 20-character minimum with case-sensitive unrestricted
- * character set provides substantially more entropy than the previous emoji
- * approach (~22 bits). A random 20-character passphrase drawn from printable
- * ASCII (~95 chars) yields ~131 bits. Even a human-chosen sentence of 20+
- * characters typically provides 40-60 bits — infeasible to brute-force within
- * the 60-second join window or against a discarded ephemeral key afterwards.
- * No normalisation is applied: the passphrase is fed into PBKDF2 as raw UTF-8
- * bytes. Case, spaces, and all characters including non-printable ones are
- * significant. Joiner must enter the passphrase with exact fidelity.
+ *  5. Reconnect: if the WebSocket drops while in a session, the client sends
+ *     "rejoin-session" with its session token; the server re-admits it and
+ *     re-establishes WebRTC with all present peers — no passphrase re-entry needed
+ *
+ * Passphrase entropy: 20-character minimum, raw UTF-8, no normalisation.
+ * Case, spaces, and all characters are significant; joiners must match exactly.
  */
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const CHUNK_SIZE      = 65536;
-const DC_BUFFER_LIMIT = 4_194_304;
-const MAX_TEXT_LEN    = 100_000;
-const PBKDF2_ITERS    = 200_000;
-const HKDF_INFO       = new TextEncoder().encode("filedrop-text-v1");
-const HKDF_GROUP_INFO = new TextEncoder().encode("filedrop-group-v1");
+const CHUNK_SIZE       = 65536;
+const DC_BUFFER_LIMIT  = 4_194_304;
+const MAX_TEXT_LEN     = 100_000;
+const PBKDF2_ITERS     = 200_000;
+const HKDF_GROUP_INFO  = new TextEncoder().encode("filedrop-group-v1");
 const JOIN_WINDOW_SECS = 60;
-
 const MIN_PASSPHRASE_LEN = 20;
 
 // ── Crypto state ──────────────────────────────────────────────────────────────
-let myECDHPriv   = null;   // CryptoKey (private, non-extractable after derivation)
-let myECDHPub    = null;   // CryptoKey (public)
-let myECDHPubHex = null;   // hex string sent to server
-
-// peerId -> CryptoKey (AES-GCM, 256-bit) — one key per peer pair (kept for UI indicator)
-const sessionKeys = new Map();
-
-// Single group key shared by ALL peers in the session.
-// Derived from IKM (PBKDF2 of passphrase + salt) — same passphrase → same key.
-// Used for text-share encryption so any peer can decrypt any other peer's messages.
-let groupKey = null;
+// Single group key shared by ALL peers: HKDF(PBKDF2(passphrase, salt))
+// Same passphrase → same key for every peer, regardless of join order.
+let groupKey     = null;
+let myECDHPubHex = null;   // random 32-byte session token (hex), used for rejoin auth
 
 // ── App state ─────────────────────────────────────────────────────────────────
 let ws          = null;
@@ -77,17 +58,13 @@ let sessionName = null;
 let iceServers  = [];
 let autoAccept  = false;
 let isCreator   = false;
+let rejoinPending = false;
 
-// Pending key exchange state for creator
-// peerId -> { ecdhPub: hex, ikm: CryptoKey } — resolved when creator gets peer-joined
-let pendingKeyExchange = null;   // { salt, ikm } stored after creator picks emoji
-
-const peers     = new Map();
-const outgoing  = new Map();
-const recvState = new Map();
-const transfers = new Map();
-let   xferSeq       = 0;
-let   rejoinPending = false;
+const peers     = new Map();   // peerId → { pc, dc, state }
+const outgoing  = new Map();   // '__pending__' → FileList
+const recvState = new Map();   // peerId | relay-peerId → { name, size, mimeType, chunks, received, xferId }
+const transfers = new Map();   // xferId → { dir, label, total, sent/ratio, done }
+let   xferSeq   = 0;
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 function connectWS() {
@@ -110,11 +87,10 @@ async function dispatch(msg) {
     case 'connected':
       myPeerId   = msg.peerId;
       iceServers = msg.iceServers || [];
-      // If we were already in a session, try to rejoin silently (WS reconnect)
       if (mySessionId && myECDHPubHex) {
+        // WS reconnect while in a session — try to rejoin silently
         rejoinPending = true;
         sig({ type: 'rejoin-session', sessionId: mySessionId, ecdhPub: myECDHPubHex });
-        // Fallback: if server doesn't confirm within 8 s, drop back to lobby
         setTimeout(() => {
           if (rejoinPending) {
             rejoinPending = false;
@@ -134,7 +110,6 @@ async function dispatch(msg) {
       renderLobby(msg.sessions);
       break;
 
-    // Creator: server confirms session created, show passphrase entry
     case 'session-created':
       mySessionId = msg.sessionId;
       sessionName = msg.name;
@@ -143,45 +118,35 @@ async function dispatch(msg) {
       renderPassphraseCreator(msg.salt);
       break;
 
-    // Joiner: server sends salt + creator pub, show passphrase entry
     case 'session-params':
       showView('pass-join');
       renderPassphraseJoiner(msg);
       break;
 
-    // Server confirms ECDH pub registered, show session view
     case 'ecdh-pub-set':
       showView('session');
       renderSessionInfo();
-      startJoinCountdown();
+      startJoinCountdown(msg.joinWindow);
       break;
 
-    // Reconnect: WS dropped and reconnected while in a session
     case 'session-rejoined':
       rejoinPending = false;
       mySessionId = msg.sessionId;
       sessionName = msg.name;
       showView('session');
       renderSessionInfo();
-      // Tear down any stale connections then re-establish
       for (const [, p] of peers) {
         if (p?.dc) try { p.dc.close(); } catch {}
         if (p?.pc) try { p.pc.close(); } catch {}
       }
       peers.clear();
-      sessionKeys.clear();
       for (const pid of (msg.peers || [])) {
         addPeer(pid);
-        const pub = msg.peerPubs?.[pid];
-        if (pub && pendingKeyExchange) {
-          await deriveSharedKey(pid, pub, pendingKeyExchange.ikm);
-        }
         await initiateRTC(pid);
       }
       toast('Reconnected to session');
       break;
 
-    // Joiner: session joined successfully
     case 'session-joined':
       mySessionId = msg.sessionId;
       sessionName = msg.name;
@@ -195,10 +160,6 @@ async function dispatch(msg) {
 
     case 'peer-joined':
       addPeer(msg.peerId);
-      // Derive shared key for this peer (creator on initial join; any peer on reconnect)
-      if (msg.ecdhPub && pendingKeyExchange) {
-        await deriveSharedKey(msg.peerId, msg.ecdhPub, pendingKeyExchange.ikm);
-      }
       break;
 
     case 'peer-left':
@@ -237,6 +198,11 @@ async function dispatch(msg) {
       await handleTextShare(msg.fromId, msg.ct, msg.iv);
       break;
 
+    case 'join-window-reopened':
+      startJoinCountdown(msg.joinWindow);
+      toast('Join window reopened');
+      break;
+
     case 'session-expired':
       toast('Session expired');
       location.reload();
@@ -256,7 +222,7 @@ async function dispatch(msg) {
 
 // ── Cryptography ──────────────────────────────────────────────────────────────
 
-/** Convert hex string to Uint8Array */
+/** Convert hex string → Uint8Array */
 function hexToBytes(hex) {
   const arr = new Uint8Array(hex.length / 2);
   for (let i = 0; i < arr.length; i++)
@@ -264,14 +230,14 @@ function hexToBytes(hex) {
   return arr;
 }
 
-/** Convert Uint8Array to hex string */
+/** Convert Uint8Array → hex string */
 function bytesToHex(buf) {
   return Array.from(new Uint8Array(buf))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
 
-/** base64url → ArrayBuffer */
+/** base64(url) → ArrayBuffer */
 function b64ToBytes(b64) {
   const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
   const arr = new Uint8Array(bin.length);
@@ -279,118 +245,41 @@ function b64ToBytes(b64) {
   return arr.buffer;
 }
 
-/** ArrayBuffer → base64 */
+/** ArrayBuffer → base64 (loop-based — safe for large buffers) */
 function bytesToB64(buf) {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+/** Random 32-byte session token used as an opaque peer identity for rejoin auth */
+function generateSessionToken() {
+  return bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
 }
 
 /**
  * Derive IKM from passphrase + salt using PBKDF2-SHA256.
- *
- * The passphrase is encoded to UTF-8 bytes with no normalisation:
- *   - Case-sensitive: 'A' and 'a' produce different keys
- *   - All characters significant: spaces, tabs, non-printable bytes all count
- *   - No trimming, no case-folding, no Unicode normalisation
- *
+ * Raw UTF-8 — no normalisation. Case, spaces, all characters are significant.
  * Returns a CryptoKey suitable as HKDF input key material.
  */
 async function deriveIKM(passphrase, saltHex) {
-  // Raw UTF-8 encoding — preserves all characters exactly as entered
   const passphraseBytes = new TextEncoder().encode(passphrase);
   const salt            = hexToBytes(saltHex);
-
   const baseKey = await crypto.subtle.importKey(
     "raw", passphraseBytes, "PBKDF2", false, ["deriveBits"]
   );
-
   const bits = await crypto.subtle.deriveBits(
     { name: "PBKDF2", salt, iterations: PBKDF2_ITERS, hash: "SHA-256" },
-    baseKey,
-    256
+    baseKey, 256
   );
-
   return crypto.subtle.importKey("raw", bits, "HKDF", false, ["deriveKey", "deriveBits"]);
-}
-
-
-/** Generate ephemeral P-256 ECDH keypair */
-async function generateECDHPair() {
-  const kp = await crypto.subtle.generateKey(
-    { name: "ECDH", namedCurve: "P-256" },
-    true,   // extractable so we can export the public key
-    ["deriveKey", "deriveBits"]
-  );
-  return kp;
-}
-
-/** Export ECDH public key as hex-encoded raw bytes (65 bytes uncompressed) */
-async function exportECDHPub(pubKey) {
-  const raw = await crypto.subtle.exportKey("raw", pubKey);
-  return bytesToHex(raw);
-}
-
-/** Import a hex-encoded raw P-256 public key */
-async function importECDHPub(hex) {
-  const raw = hexToBytes(hex);
-  return crypto.subtle.importKey(
-    "raw", raw,
-    { name: "ECDH", namedCurve: "P-256" },
-    false, []
-  );
-}
-
-/**
- * Derive the shared AES-256-GCM session key for text encryption.
- *
- *   ecdh_secret  = ECDH(my_priv, their_pub)
- *   session_key  = HKDF-SHA256(ecdh_secret, ikm_bits, "filedrop-text-v1")
- *
- * The ikm (from PBKDF2 over the emoji) binds the key to knowledge of the
- * emoji sequence. Without the emoji, an observer of the ECDH public keys
- * cannot derive the session key.
- */
-async function deriveSharedKey(peerId, theirPubHex, ikmKey) {
-  const theirPub = await importECDHPub(theirPubHex);
-
-  // ECDH raw shared secret (32 bytes for P-256)
-  const sharedBits = await crypto.subtle.deriveBits(
-    { name: "ECDH", public: theirPub },
-    myECDHPriv,
-    256
-  );
-
-  // Use shared secret as HKDF key material; ikm provides emoji binding
-  const hkdfInput = await crypto.subtle.importKey(
-    "raw", sharedBits, "HKDF", false, ["deriveKey"]
-  );
-
-  // Incorporate emoji-derived IKM as additional context via salt parameter
-  const ikmBits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new Uint8Array(0) },
-    ikmKey,
-    256
-  );
-
-  const sessionKey = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: ikmBits, info: HKDF_INFO },
-    hkdfInput,
-    { name: "AES-GCM", length: 256 },
-    false,   // non-extractable
-    ["encrypt", "decrypt"]
-  );
-
-  sessionKeys.set(peerId, sessionKey);
-
-  // Discard private key reference after all current peers are keyed
-  // (kept alive in myECDHPriv until all joiners are processed — cleared on lock)
 }
 
 /**
  * Derive a single AES-256-GCM group key from IKM.
- *
- * All peers in a session share the same passphrase → same IKM → same groupKey.
- * This key is used for text-share so every peer can decrypt every other peer's
- * messages, regardless of how many peers are in the session.
+ * All peers sharing the same passphrase derive the same key, enabling broadcast
+ * text decryption regardless of session size or join order.
  */
 async function deriveGroupKey(ikmKey) {
   return crypto.subtle.deriveKey(
@@ -418,29 +307,6 @@ async function decryptWithGroupKey(ctB64, ivB64) {
   return new TextDecoder().decode(pt);
 }
 
-/** Encrypt plaintext for a specific peer */
-async function encryptText(peerId, plaintext) {
-  const key = sessionKeys.get(peerId);
-  if (!key) throw new Error(`No session key for peer ${peerId}`);
-
-  const iv  = crypto.getRandomValues(new Uint8Array(12));
-  const enc = new TextEncoder().encode(plaintext);
-  const ct  = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc);
-
-  return { ct: bytesToB64(ct), iv: bytesToB64(iv.buffer) };
-}
-
-/** Decrypt ciphertext from a specific peer */
-async function decryptText(peerId, ctB64, ivB64) {
-  const key = sessionKeys.get(peerId);
-  if (!key) throw new Error(`No session key for peer ${peerId}`);
-
-  const ct = b64ToBytes(ctB64);
-  const iv = b64ToBytes(ivB64);
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, key, ct);
-  return new TextDecoder().decode(pt);
-}
-
 // ── Passphrase entry (creator) ────────────────────────────────────────────────
 let creatorSalt = null;
 
@@ -456,13 +322,11 @@ function renderPassphraseCreator(salt) {
   count.textContent = '0 / 20 minimum';
 
   input.oninput = () => {
-    // Use the raw .value length — every character counts
     const len = input.value.length;
     count.textContent = `${len} character${len !== 1 ? 's' : ''}${len < MIN_PASSPHRASE_LEN ? ' · ' + (MIN_PASSPHRASE_LEN - len) + ' more needed' : ' ✓'}`;
-    // Rough visual strength bar: 20 chars = 40%, 40 chars = 80%, 60+ = 100%
     const pct = Math.min(100, Math.round(len / 60 * 100));
-    meter.style.width  = pct + '%';
-    meter.style.background = len < MIN_PASSPHRASE_LEN ? 'var(--red)' : len < 40 ? 'var(--amber)' : 'var(--green)';
+    meter.style.width      = pct + '%';
+    meter.style.background = len < MIN_PASSPHRASE_LEN ? 'var(--red)' : len < 40 ? 'var(--amber)' : 'var(--accent)';
     btn.disabled = len < MIN_PASSPHRASE_LEN;
   };
 
@@ -473,29 +337,20 @@ function renderPassphraseCreator(salt) {
 async function confirmPassphrase() {
   const input = document.getElementById('creator-passphrase');
   const btn   = document.getElementById('btn-pass-done');
-  // Read raw value — no normalisation, no trim
   const passphrase = input.value;
-
   if (passphrase.length < MIN_PASSPHRASE_LEN) return;
 
-  btn.disabled     = true;
-  btn.textContent  = 'Setting up…';
-
+  btn.disabled    = true;
+  btn.textContent = 'Setting up…';
   try {
-    const ikm = await deriveIKM(passphrase, creatorSalt);
+    const ikm  = await deriveIKM(passphrase, creatorSalt);
     groupKey   = await deriveGroupKey(ikm);
-
-    const kp     = await generateECDHPair();
-    myECDHPriv   = kp.privateKey;
-    myECDHPub    = kp.publicKey;
-    myECDHPubHex = await exportECDHPub(myECDHPub);
-
-    pendingKeyExchange = { ikm };
+    myECDHPubHex = generateSessionToken();
     sig({ type: 'set-ecdh-pub', ecdhPub: myECDHPubHex });
   } catch (e) {
     console.error('Passphrase setup failed:', e);
     btn.disabled    = false;
-    btn.textContent = 'Set Passphrase';
+    btn.textContent = 'confirm & open session';
     toast('⚠ Crypto setup failed — HTTPS is required');
   }
 }
@@ -527,54 +382,35 @@ function renderPassphraseJoiner(params) {
 async function confirmPassphraseJoin() {
   const input = document.getElementById('joiner-passphrase');
   const btn   = document.getElementById('btn-pass-join-done');
-  // Raw value — no normalisation
   const passphrase = input.value;
-
   if (passphrase.length < MIN_PASSPHRASE_LEN) return;
 
   btn.disabled    = true;
   btn.textContent = 'Joining…';
-
   try {
     const params = joinerSessionParams;
     const ikm    = await deriveIKM(passphrase, params.salt);
     groupKey     = await deriveGroupKey(ikm);
-
-    const kp     = await generateECDHPair();
-    myECDHPriv   = kp.privateKey;
-    myECDHPub    = kp.publicKey;
-    myECDHPubHex = await exportECDHPub(myECDHPub);
-
-    await deriveSharedKey('__creator__', params.creatorPub, ikm);
-
+    myECDHPubHex = generateSessionToken();
     sig({ type: 'join-session', sessionId: params.sessionId, ecdhPub: myECDHPubHex });
-    pendingKeyExchange = { ikm };
   } catch (e) {
     console.error('Join failed:', e);
     btn.disabled    = false;
-    btn.textContent = 'Join Session';
+    btn.textContent = 'join session';
     toast('⚠ Crypto setup failed — HTTPS is required');
-  }
-}
-
-// After joining, we learn the creator's real peerId from 'session-joined'.peers[0]
-// We remap the '__creator__' key slot to their actual peerId.
-function remapCreatorKey(creatorPeerId) {
-  const key = sessionKeys.get('__creator__');
-  if (key) {
-    sessionKeys.set(creatorPeerId, key);
-    sessionKeys.delete('__creator__');
   }
 }
 
 // ── Session display ───────────────────────────────────────────────────────────
 let countdownTimer = null;
 
-function startJoinCountdown() {
+function startJoinCountdown(secs) {
+  secs = secs || JOIN_WINDOW_SECS;
+  clearInterval(countdownTimer);
   const el = document.getElementById('join-countdown');
   if (!el) return;
   el.classList.remove('hidden');
-  let secs = JOIN_WINDOW_SECS;
+  el.style.color = '';
   el.textContent = `Join window: ${secs}s`;
   countdownTimer = setInterval(() => {
     secs--;
@@ -593,6 +429,8 @@ function renderSessionInfo() {
   if (nameEl) nameEl.textContent = sessionName || '';
   const idEl = document.getElementById('my-peer-id-disp');
   if (idEl) idEl.textContent = myPeerId ? `your id: ${myPeerId}` : '';
+  const reopenBtn = document.getElementById('btn-reopen-window');
+  if (reopenBtn) reopenBtn.classList.toggle('hidden', !isCreator);
 }
 
 // ── Session lifecycle ─────────────────────────────────────────────────────────
@@ -732,14 +570,6 @@ async function sendFilesToPeer(peerId, files) {
 // ── Server-relay file transfer (fallback when WebRTC fails) ──────────────────
 const RELAY_CHUNK_SIZE = 32768;  // 32 KB — safe for base64 in JSON
 
-function arrayBufToB64(buf) {
-  // Loop-based btoa to avoid call-stack overflow on large buffers
-  const bytes = new Uint8Array(buf);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-
 async function sendFilesToPeerViaRelay(peerId, files) {
   const fileArr = Array.from(files);
   const total   = fileArr.reduce((a, f) => a + f.size, 0);
@@ -759,7 +589,7 @@ async function sendFilesToPeerViaRelay(peerId, files) {
     let offset = 0;
     while (offset < buf.byteLength) {
       const slice = buf.slice(offset, offset + RELAY_CHUNK_SIZE);
-      sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'data', data: arrayBufToB64(slice) });
+      sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'data', data: bytesToB64(slice) });
       offset += slice.byteLength;
       const t = transfers.get(xferId);
       if (t) { t.sent += slice.byteLength; renderTransfers(); }
@@ -777,9 +607,9 @@ function handleRelayChunk(fromId, msg) {
     recvState.set(key, {
       name: msg.name, size: msg.size,
       mimeType: msg.mimeType || 'application/octet-stream',
-      chunks: [], received: 0, xferId: msg.xferId,
+      chunks: [], received: 0,
     });
-    ensureRecvTransfer(fromId, msg);
+    ensureRecvTransfer(key, msg);
   } else if (msg.kind === 'data') {
     const r = recvState.get(key);
     if (!r) return;
@@ -813,6 +643,7 @@ function handleFileAnnounce(fromId, files) {
 
 function acceptFile(fromId)  { sig({ type: 'file-accept', targetId: fromId }); removeIncoming(fromId); }
 function rejectFile(fromId)  { sig({ type: 'file-reject', targetId: fromId }); removeIncoming(fromId); }
+
 function handleFileAccepted(fromId) {
   const f = outgoing.get('__pending__');
   if (!f) return;
@@ -823,6 +654,7 @@ function handleFileAccepted(fromId) {
     sendFilesToPeerViaRelay(fromId, f);
   }
 }
+
 function handleFileRejected(fromId) { toast(`Peer declined the transfer`); }
 
 // ── Folder → zip ──────────────────────────────────────────────────────────────
@@ -833,9 +665,9 @@ async function handleDroppedItems(dataTransfer) {
     if (item.kind !== 'file') continue;
     const entry = item.webkitGetAsEntry?.();
     if (entry?.isDirectory) {
-      const zip    = await loadJSZip();
+      const zip  = await loadJSZip();
       await addDirToZip(entry, zip.folder(entry.name));
-      const blob   = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
       files.push(new File([blob], `${entry.name}.zip`, { type: 'application/zip' }));
     } else {
       const file = item.getAsFile();
@@ -883,7 +715,7 @@ function loadJSZip() {
   });
 }
 
-// ── Text share (encrypted) ────────────────────────────────────────────────────
+// ── Text share (E2EE group key) ───────────────────────────────────────────────
 async function sendText() {
   const ta   = document.getElementById('text-input');
   const text = ta.value.trim();
@@ -921,12 +753,12 @@ function renderTextShare(fromId, text) {
   const panel = document.getElementById('text-panel');
   const list  = document.getElementById('text-list');
   panel.classList.remove('hidden');
-  const from  = fromId === 'me' ? 'You' : `Peer ${fromId.slice(0,8)}`;
-  const card  = document.createElement('div');
+  const from = fromId === 'me' ? 'You' : `Peer ${escHtml(fromId.slice(0,8))}`;
+  const card = document.createElement('div');
   card.className = 'text-share-card';
   card.innerHTML = `<div class="text-share-from">${from} <span style="opacity:.5;font-size:.65rem">· E2EE</span></div>${escHtml(text)}`;
   const btn = document.createElement('button');
-  btn.className = 'btn btn-ghost btn-xs mt-sm';
+  btn.className   = 'btn btn-ghost btn-xs mt-sm';
   btn.textContent = 'Copy';
   btn.onclick = () => { navigator.clipboard.writeText(text); toast('Copied'); };
   card.appendChild(btn);
@@ -943,17 +775,15 @@ function showQR() {
     <div class="modal">
       <h3>Join this session</h3>
       <div id="qr-canvas"></div>
-      <div class="modal-sub">Open <strong>${location.host}</strong>, find this session, then match the emoji.</div>
+      <div class="modal-sub">Open <strong>${escHtml(location.host)}</strong>, find this session, then enter the passphrase.</div>
       <button class="btn btn-ghost btn-sm mt" onclick="this.closest('.modal-backdrop').remove()">Close</button>
     </div>`;
   document.body.appendChild(backdrop);
   loadQRLib().then(QRC => {
     new QRC(document.getElementById('qr-canvas'), {
       text: location.href,
-      width: 200,
-      height: 200,
-      colorDark: '#60a5fa',
-      colorLight: '#111827',
+      width: 200, height: 200,
+      colorDark: '#60a5fa', colorLight: '#111827',
     });
   });
 }
@@ -972,8 +802,6 @@ function loadQRLib() {
 // ── Peers ─────────────────────────────────────────────────────────────────────
 function addPeer(peerId) {
   if (!peers.has(peerId)) peers.set(peerId, { state: 'connecting' });
-  // Remap creator key if joiner
-  if (!isCreator) remapCreatorKey(peerId);
   renderPeers();
 }
 
@@ -982,7 +810,6 @@ function removePeer(peerId) {
   if (p?.dc) try { p.dc.close(); } catch {}
   if (p?.pc) try { p.pc.close(); } catch {}
   peers.delete(peerId);
-  sessionKeys.delete(peerId);
   renderPeers();
   toast('A peer disconnected');
 }
@@ -997,7 +824,7 @@ function renderPeers() {
   }
   list.innerHTML = '';
   for (const [pid, p] of peers) {
-    const col = p.state === 'connected' ? 'var(--green)'
+    const col = p.state === 'connected' ? 'var(--accent)'
               : p.state === 'relay'     ? 'var(--blue)'
               : p.state === 'failed'    ? 'var(--red)'
               : 'var(--amber)';
@@ -1007,19 +834,19 @@ function renderPeers() {
     el.innerHTML = `
       <div class="peer-ident">
         <span style="width:7px;height:7px;border-radius:50%;background:${col};flex-shrink:0;display:inline-block"></span>
-        ${pid.slice(0,8)}…
+        ${escHtml(pid.slice(0,8))}…
       </div>
-      <span class="badge">${hasKey} ${p.state || 'connecting'}</span>`;
+      <span class="badge">${hasKey} ${escHtml(p.state || 'connecting')}</span>`;
     list.appendChild(el);
   }
 }
 
 // ── Transfer UI ───────────────────────────────────────────────────────────────
-function ensureRecvTransfer(peerId, meta) {
+function ensureRecvTransfer(key, meta) {
   const xferId = `rcv-${++xferSeq}`;
-  const r = recvState.get(peerId);
+  const r = recvState.get(key);
   if (r) r.xferId = xferId;
-  transfers.set(xferId, { dir: 'recv', label: meta.name, total: meta.size, recv: 0, done: false });
+  transfers.set(xferId, { dir: 'recv', label: meta.name, total: meta.size, ratio: 0, done: false });
   renderTransfers();
   return xferId;
 }
@@ -1068,9 +895,11 @@ function renderIncoming(fromId, files) {
     <div class="incoming-label">📥 Incoming transfer</div>
     <div class="incoming-meta">${files.length} file(s) · ${total}<br><span style="opacity:.65;font-size:.75rem">${names}</span></div>
     <div class="flex gap-sm">
-      <button class="btn btn-green btn-sm" onclick="acceptFile('${fromId}')">Accept</button>
-      <button class="btn btn-ghost btn-sm" onclick="rejectFile('${fromId}')">Decline</button>
+      <button class="btn btn-green btn-sm" data-action="accept">Accept</button>
+      <button class="btn btn-ghost btn-sm" data-action="reject">Decline</button>
     </div>`;
+  card.querySelector('[data-action="accept"]').addEventListener('click', () => acceptFile(fromId));
+  card.querySelector('[data-action="reject"]').addEventListener('click', () => rejectFile(fromId));
   list.appendChild(card);
   toast('Incoming file transfer request');
 }
@@ -1117,7 +946,7 @@ function renderLobby(list) {
     card.innerHTML = `
       <div>
         <div class="session-name">${escHtml(s.name)}</div>
-        <div class="session-meta">${s.sessionId.slice(0,8)}…</div>
+        <div class="session-meta">${escHtml(s.sessionId.slice(0,8))}…</div>
       </div>
       <div class="flex gap-sm" style="align-items:center">
         <span class="badge blue">${s.peerCount} peer${s.peerCount !== 1 ? 's' : ''}</span>
@@ -1141,8 +970,8 @@ function initDropzone() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function setStatus(ok) {
-  document.getElementById('conn-dot').className      = 'dot ' + (ok ? 'on' : 'off');
-  document.getElementById('conn-label').textContent  = ok ? 'Connected' : 'Disconnected';
+  document.getElementById('conn-dot').className     = 'dot ' + (ok ? 'on' : 'off');
+  document.getElementById('conn-label').textContent = ok ? 'Connected' : 'Disconnected';
 }
 
 function toast(msg) {
@@ -1156,8 +985,8 @@ function toast(msg) {
 function toggleReveal(inputId, btn) {
   const el = document.getElementById(inputId);
   if (!el) return;
-  const show = el.type === 'password';
-  el.type    = show ? 'text' : 'password';
+  const show  = el.type === 'password';
+  el.type     = show ? 'text' : 'password';
   btn.textContent = show ? '🙈' : '👁';
 }
 
@@ -1177,29 +1006,30 @@ function escHtml(s) {
 document.addEventListener('DOMContentLoaded', () => {
   if (!crypto?.subtle) {
     document.body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;padding:2rem;text-align:center;font-family:sans-serif;color:#f87171;background:#111827">
-      <div><h2>HTTPS required</h2><p style="color:#9ca3af;max-width:400px">This app uses the Web Crypto API, which browsers only allow over HTTPS or localhost.<br><br>Please serve FileDrop over HTTPS or access it via <code>localhost</code>.</p></div>
+      <div><h2>HTTPS required</h2><p style="color:#9ca3af;max-width:400px">This app uses the Web Crypto API, which browsers only allow over HTTPS or localhost.<br><br>Please serve DropZone over HTTPS or access it via <code>localhost</code>.</p></div>
     </div>`;
     return;
   }
   initDropzone();
 
   document.getElementById('auto-accept').addEventListener('change', e => { autoAccept = e.target.checked; });
-  document.getElementById('btn-create-session').onclick  = createSession;
-  document.getElementById('btn-refresh-lobby').onclick   = refreshLobby;
-  document.getElementById('btn-pass-done').onclick      = confirmPassphrase;
-  document.getElementById('btn-pass-join-done').onclick = confirmPassphraseJoin;
-  document.getElementById('btn-pass-cancel').onclick    = () => showView('lobby');
-  document.getElementById('btn-pass-join-cancel').onclick = () => showView('lobby');
-  document.getElementById('btn-leave-session').onclick   = () => {
+  document.getElementById('btn-create-session').onclick    = createSession;
+  document.getElementById('btn-refresh-lobby').onclick     = refreshLobby;
+  document.getElementById('btn-pass-done').onclick         = confirmPassphrase;
+  document.getElementById('btn-pass-join-done').onclick    = confirmPassphraseJoin;
+  document.getElementById('btn-pass-cancel').onclick       = () => showView('lobby');
+  document.getElementById('btn-pass-join-cancel').onclick  = () => showView('lobby');
+  document.getElementById('btn-leave-session').onclick     = () => {
     clearInterval(countdownTimer);
     sig({ type: 'leave-session' });
     mySessionId = null; sessionName = null; isCreator = false;
-    peers.clear(); transfers.clear(); recvState.clear(); outgoing.clear(); sessionKeys.clear();
-    pendingKeyExchange = null; myECDHPriv = null; myECDHPub = null; myECDHPubHex = null; groupKey = null;
+    groupKey = null; myECDHPubHex = null;
+    peers.clear(); transfers.clear(); recvState.clear(); outgoing.clear();
     showView('lobby');
   };
-  document.getElementById('btn-show-qr').onclick    = showQR;
-  document.getElementById('btn-send-text').onclick  = sendText;
+  document.getElementById('btn-reopen-window').onclick = () => sig({ type: 'reopen-join-window' });
+  document.getElementById('btn-show-qr').onclick   = showQR;
+  document.getElementById('btn-send-text').onclick = sendText;
   document.getElementById('text-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendText();
   });

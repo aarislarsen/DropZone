@@ -5,8 +5,18 @@ Python 3.11+, aiohttp
 Run:
     python server.py
     python server.py --host 0.0.0.0 --port 8080
+    python server.py --port 443 --join-window 120
+    python server.py --ssl-cert /etc/ssl/certs/my.crt --ssl-key /etc/ssl/private/my.key
 
-Env vars (or .env file):
+CLI flags (all optional):
+    --host            Bind address (default: 0.0.0.0)
+    --port            TCP port (default: 8080)
+    --join-window     Seconds the join window stays open (default: 60)
+    --no-ssl          Disable TLS (not recommended; Web Crypto requires HTTPS)
+    --ssl-cert        Path to PEM certificate file (default: auto-generate filedrop-cert.pem)
+    --ssl-key         Path to PEM private key file (default: auto-generate filedrop-key.pem)
+
+Env vars (or .env file) — CLI flags take precedence when both are set:
     HOST              0.0.0.0
     PORT              8080
     SESSION_TTL       600        seconds of inactivity before session auto-closes
@@ -329,7 +339,7 @@ async def handle_message(peer: Peer, msg: dict):
             return
         session.creator_pub = pub
         session.peer_pubs[peer.peer_id] = pub
-        await send(peer.ws, {"type": "ecdh-pub-set"})
+        await send(peer.ws, {"type": "ecdh-pub-set", "joinWindow": JOIN_WINDOW})
         log.info(f"Session {sid[:8]}… ECDH pub registered, join window open for {JOIN_WINDOW}s")
 
     # ── List open sessions ────────────────────────────────────────────────────
@@ -406,6 +416,23 @@ async def handle_message(peer: Peer, msg: dict):
     # ── Leave ─────────────────────────────────────────────────────────────────
     elif t == "leave-session":
         await cleanup_peer(peer)
+
+    # ── Reopen join window (creator only) ─────────────────────────────────────
+    elif t == "reopen-join-window":
+        sid     = peer.session_id
+        session = sessions.get(sid) if sid else None
+        if not session:
+            await send(peer.ws, {"type": "error", "message": "Not in a session"})
+            return
+        # Verify the requester is the session creator by matching their session token
+        if session.peer_pubs.get(peer.peer_id) != session.creator_pub:
+            await send(peer.ws, {"type": "error", "message": "Only the session creator can reopen the join window"})
+            return
+        session.locked     = False
+        session.created_at = time.time()
+        session.touch()
+        await send(peer.ws, {"type": "join-window-reopened", "joinWindow": JOIN_WINDOW})
+        log.info(f"Session {sid[:8]}… join window reopened by creator ({peer.peer_id[:8]}…)")
 
     # ── Rejoin session (after WS reconnect — no passphrase re-entry needed) ──
     elif t == "rejoin-session":
@@ -542,15 +569,45 @@ async def cleanup_peer(peer: Peer):
 async def index_handler(request: web.Request) -> web.Response:
     return web.FileResponse(Path(__file__).parent / "static" / "index.html")
 
+_cleanup_task: "asyncio.Task | None" = None
+
+async def _on_startup(app: web.Application) -> None:
+    global _cleanup_task
+    _cleanup_task = asyncio.ensure_future(cleanup_task())
+
+async def _on_shutdown(app: web.Application) -> None:
+    """
+    Called by aiohttp when SIGINT / SIGTERM is received.
+    1. Cancel the background cleanup loop.
+    2. Close every open WebSocket connection so clients reconnect cleanly
+       rather than waiting for a TCP timeout.
+    """
+    global _cleanup_task
+    if _cleanup_task is not None:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        _cleanup_task = None
+
+    open_peers = list(peers.values())
+    log.info(f"Shutting down — closing {len(open_peers)} connection(s)…")
+    for peer in open_peers:
+        try:
+            await peer.ws.close()
+        except Exception:
+            pass
+    log.info("DropZone stopped.")
+
 def create_app() -> web.Application:
     app = web.Application()
     static_dir = Path(__file__).parent / "static"
     app.router.add_get("/ws",  ws_handler)
     app.router.add_get("/",    index_handler)
     app.router.add_static("/", static_dir, show_index=False)
-    async def start_cleanup(app):
-        asyncio.ensure_future(cleanup_task())
-    app.on_startup.append(start_cleanup)
+    app.on_startup.append(_on_startup)
+    app.on_shutdown.append(_on_shutdown)
     return app
 
 # ── TURN connectivity check ───────────────────────────────────────────────────
@@ -750,7 +807,32 @@ def _make_ssl_context_openssl(cert_path: Path, key_path: Path) -> "ssl.SSLContex
         log.error(f"SSL setup failed: {e}")
         return None
 
-def make_ssl_context() -> "ssl.SSLContext | None":
+def make_ssl_context(
+    cert_path: "Path | None" = None,
+    key_path:  "Path | None" = None,
+) -> "ssl.SSLContext | None":
+    """
+    Build an SSL context.
+
+    If cert_path and key_path are provided (via --ssl-cert / --ssl-key), those
+    files are loaded directly and no certificate is generated.
+
+    If neither is provided, the default auto-generate/reuse behaviour applies:
+    existing filedrop-cert.pem / filedrop-key.pem are reused, or a new
+    self-signed certificate is generated and saved alongside server.py.
+    """
+    # ── Explicit paths supplied via CLI ───────────────────────────────────────
+    if cert_path is not None and key_path is not None:
+        try:
+            ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ctx.load_cert_chain(str(cert_path), str(key_path))
+            log.info(f"Loaded TLS certificate from {cert_path}")
+            return ctx
+        except Exception as e:
+            log.error(f"Failed to load SSL certificate ({cert_path}): {e}")
+            return None
+
+    # ── Default paths: reuse or auto-generate ─────────────────────────────────
     cert_path = Path(__file__).parent / "filedrop-cert.pem"
     key_path  = Path(__file__).parent / "filedrop-key.pem"
 
@@ -809,16 +891,47 @@ def make_ssl_context() -> "ssl.SSLContext | None":
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FileDrop signaling server")
-    parser.add_argument("--host", default=HOST)
-    parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--no-ssl", action="store_true", help="Disable TLS (not recommended)")
+    parser = argparse.ArgumentParser(
+        description="DropZone signaling server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--host",        default=HOST,
+                        help="Bind address")
+    parser.add_argument("--port",        type=int, default=PORT, metavar="PORT",
+                        help="TCP port to listen on")
+    parser.add_argument("--join-window", type=int, default=None, metavar="SECS",
+                        help=f"Seconds the join window stays open after session creation (env default: {JOIN_WINDOW})")
+    parser.add_argument("--no-ssl",      action="store_true",
+                        help="Disable TLS (not recommended — Web Crypto requires HTTPS)")
+    parser.add_argument("--ssl-cert",    default=None, metavar="PATH",
+                        help="Path to PEM certificate file (default: auto-generate filedrop-cert.pem)")
+    parser.add_argument("--ssl-key",     default=None, metavar="PATH",
+                        help="Path to PEM private key file (default: auto-generate filedrop-key.pem)")
     args = parser.parse_args()
+
+    # ── CLI overrides ──────────────────────────────────────────────────────────
+    if args.join_window is not None:
+        JOIN_WINDOW = args.join_window
+
+    if (args.ssl_cert is None) != (args.ssl_key is None):
+        parser.error("--ssl-cert and --ssl-key must be used together")
+
+    # ── Start ──────────────────────────────────────────────────────────────────
     check_or_install_coturn()
     check_turn_connectivity()
-    ssl_ctx = None if args.no_ssl else make_ssl_context()
-    proto   = "https" if ssl_ctx else "http"
-    log.info(f"FileDrop on {proto}://{args.host}:{args.port}  TTL={SESSION_TTL}s  window={JOIN_WINDOW}s  TURN={'yes' if TURN_URL else 'no'}")
+
+    if args.no_ssl:
+        ssl_ctx = None
+    elif args.ssl_cert:
+        ssl_ctx = make_ssl_context(Path(args.ssl_cert), Path(args.ssl_key))
+    else:
+        ssl_ctx = make_ssl_context()
+
+    proto = "https" if ssl_ctx else "http"
+    log.info(
+        f"DropZone on {proto}://{args.host}:{args.port}  "
+        f"TTL={SESSION_TTL}s  window={JOIN_WINDOW}s  TURN={'yes' if TURN_URL else 'no'}"
+    )
     if ssl_ctx is None and not args.no_ssl:
         log.warning("Running without TLS — Web Crypto API will be unavailable in browsers")
     web.run_app(create_app(), host=args.host, port=args.port, print=None, ssl_context=ssl_ctx)
