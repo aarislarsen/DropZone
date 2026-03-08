@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FileDrop</title>
-  <link rel="stylesheet" href="/style.css">
+  <title>DropZone</title>
+  <link rel="stylesheet" href="/style.css?v=3">
 </head>
 <body>
 
 <div class="app">
 
   <header>
-    <div class="logo">File<span>Drop</span></div>
+    <div class="logo">Drop<span>Zone</span></div>
     <div class="conn-badge">
       <span class="dot" id="conn-dot"></span>
       <span id="conn-label">connecting…</span>
@@ -131,11 +131,11 @@
         </div>
       </div>
       <div class="panel-body" style="text-align:center">
-        <div class="session-id-badge" id="session-code">——</div>
-        <div style="font-size:.72rem;color:var(--text3);text-transform:capitalize;letter-spacing:.06em" id="session-name-disp"></div>
+        <div class="session-id-badge" id="session-name-disp"></div>
         <div class="muted mt-sm" style="font-size:.65rem;letter-spacing:.04em">
           🔒 text e2ee · files dtls p2p
         </div>
+        <div class="muted mt-sm" style="font-size:.6rem;letter-spacing:.04em;color:var(--text3)" id="my-peer-id-disp"></div>
       </div>
     </div>
 
@@ -217,6 +217,6 @@
 </div>
 
 <div class="toast-wrap" id="toasts"></div>
-<script src="/app.js"></script>
+<script src="/app.js?v=3"></script>
 </body>
 </html>

@@ -51,6 +51,7 @@ const DC_BUFFER_LIMIT = 4_194_304;
 const MAX_TEXT_LEN    = 100_000;
 const PBKDF2_ITERS    = 200_000;
 const HKDF_INFO       = new TextEncoder().encode("filedrop-text-v1");
+const HKDF_GROUP_INFO = new TextEncoder().encode("filedrop-group-v1");
 const JOIN_WINDOW_SECS = 60;
 
 const MIN_PASSPHRASE_LEN = 20;
@@ -60,8 +61,13 @@ let myECDHPriv   = null;   // CryptoKey (private, non-extractable after derivati
 let myECDHPub    = null;   // CryptoKey (public)
 let myECDHPubHex = null;   // hex string sent to server
 
-// peerId -> CryptoKey (AES-GCM, 256-bit) — one key per peer pair
+// peerId -> CryptoKey (AES-GCM, 256-bit) — one key per peer pair (kept for UI indicator)
 const sessionKeys = new Map();
+
+// Single group key shared by ALL peers in the session.
+// Derived from IKM (PBKDF2 of passphrase + salt) — same passphrase → same key.
+// Used for text-share encryption so any peer can decrypt any other peer's messages.
+let groupKey = null;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 let ws          = null;
@@ -80,7 +86,8 @@ const peers     = new Map();
 const outgoing  = new Map();
 const recvState = new Map();
 const transfers = new Map();
-let   xferSeq   = 0;
+let   xferSeq       = 0;
+let   rejoinPending = false;
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 function connectWS() {
@@ -103,8 +110,24 @@ async function dispatch(msg) {
     case 'connected':
       myPeerId   = msg.peerId;
       iceServers = msg.iceServers || [];
-      showView('lobby');
-      refreshLobby();
+      // If we were already in a session, try to rejoin silently (WS reconnect)
+      if (mySessionId && myECDHPubHex) {
+        rejoinPending = true;
+        sig({ type: 'rejoin-session', sessionId: mySessionId, ecdhPub: myECDHPubHex });
+        // Fallback: if server doesn't confirm within 8 s, drop back to lobby
+        setTimeout(() => {
+          if (rejoinPending) {
+            rejoinPending = false;
+            mySessionId = null; sessionName = null; isCreator = false;
+            showView('lobby');
+            refreshLobby();
+            toast('Could not rejoin session — please create or join a new one');
+          }
+        }, 8000);
+      } else {
+        showView('lobby');
+        refreshLobby();
+      }
       break;
 
     case 'sessions-list':
@@ -133,6 +156,31 @@ async function dispatch(msg) {
       startJoinCountdown();
       break;
 
+    // Reconnect: WS dropped and reconnected while in a session
+    case 'session-rejoined':
+      rejoinPending = false;
+      mySessionId = msg.sessionId;
+      sessionName = msg.name;
+      showView('session');
+      renderSessionInfo();
+      // Tear down any stale connections then re-establish
+      for (const [, p] of peers) {
+        if (p?.dc) try { p.dc.close(); } catch {}
+        if (p?.pc) try { p.pc.close(); } catch {}
+      }
+      peers.clear();
+      sessionKeys.clear();
+      for (const pid of (msg.peers || [])) {
+        addPeer(pid);
+        const pub = msg.peerPubs?.[pid];
+        if (pub && pendingKeyExchange) {
+          await deriveSharedKey(pid, pub, pendingKeyExchange.ikm);
+        }
+        await initiateRTC(pid);
+      }
+      toast('Reconnected to session');
+      break;
+
     // Joiner: session joined successfully
     case 'session-joined':
       mySessionId = msg.sessionId;
@@ -141,14 +189,14 @@ async function dispatch(msg) {
       renderSessionInfo();
       for (const pid of (msg.peers || [])) {
         addPeer(pid);
-        await initiateRTC(pid);
+        try { await initiateRTC(pid); } catch (e) { console.error('RTC init error', pid, e); }
       }
       break;
 
     case 'peer-joined':
       addPeer(msg.peerId);
-      // Creator derives shared key with this joiner using their ECDH pub
-      if (isCreator && msg.ecdhPub && pendingKeyExchange) {
+      // Derive shared key for this peer (creator on initial join; any peer on reconnect)
+      if (msg.ecdhPub && pendingKeyExchange) {
         await deriveSharedKey(msg.peerId, msg.ecdhPub, pendingKeyExchange.ikm);
       }
       break;
@@ -181,6 +229,10 @@ async function dispatch(msg) {
       handleFileRejected(msg.fromId);
       break;
 
+    case 'relay-chunk':
+      handleRelayChunk(msg.fromId, msg);
+      break;
+
     case 'text-share':
       await handleTextShare(msg.fromId, msg.ct, msg.iv);
       break;
@@ -192,6 +244,12 @@ async function dispatch(msg) {
 
     case 'error':
       toast(`⚠ ${msg.message}`);
+      if (rejoinPending) {
+        rejoinPending = false;
+        mySessionId = null; sessionName = null; isCreator = false;
+        showView('lobby');
+        refreshLobby();
+      }
       break;
   }
 }
@@ -327,6 +385,39 @@ async function deriveSharedKey(peerId, theirPubHex, ikmKey) {
   // (kept alive in myECDHPriv until all joiners are processed — cleared on lock)
 }
 
+/**
+ * Derive a single AES-256-GCM group key from IKM.
+ *
+ * All peers in a session share the same passphrase → same IKM → same groupKey.
+ * This key is used for text-share so every peer can decrypt every other peer's
+ * messages, regardless of how many peers are in the session.
+ */
+async function deriveGroupKey(ikmKey) {
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: HKDF_GROUP_INFO },
+    ikmKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptWithGroupKey(plaintext) {
+  const iv  = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder().encode(plaintext);
+  const ct  = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, groupKey, enc);
+  return { ct: bytesToB64(ct), iv: bytesToB64(iv.buffer) };
+}
+
+async function decryptWithGroupKey(ctB64, ivB64) {
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: new Uint8Array(b64ToBytes(ivB64)) },
+    groupKey,
+    b64ToBytes(ctB64)
+  );
+  return new TextDecoder().decode(pt);
+}
+
 /** Encrypt plaintext for a specific peer */
 async function encryptText(peerId, plaintext) {
   const key = sessionKeys.get(peerId);
@@ -392,6 +483,7 @@ async function confirmPassphrase() {
 
   try {
     const ikm = await deriveIKM(passphrase, creatorSalt);
+    groupKey   = await deriveGroupKey(ikm);
 
     const kp     = await generateECDHPair();
     myECDHPriv   = kp.privateKey;
@@ -446,6 +538,7 @@ async function confirmPassphraseJoin() {
   try {
     const params = joinerSessionParams;
     const ikm    = await deriveIKM(passphrase, params.salt);
+    groupKey     = await deriveGroupKey(ikm);
 
     const kp     = await generateECDHPair();
     myECDHPriv   = kp.privateKey;
@@ -496,8 +589,10 @@ function startJoinCountdown() {
 }
 
 function renderSessionInfo() {
-  document.getElementById('session-code').textContent      = mySessionId ? mySessionId.slice(0, 8) + '…' : '—';
-  document.getElementById('session-name-disp').textContent = sessionName || '';
+  const nameEl = document.getElementById('session-name-disp');
+  if (nameEl) nameEl.textContent = sessionName || '';
+  const idEl = document.getElementById('my-peer-id-disp');
+  if (idEl) idEl.textContent = myPeerId ? `your id: ${myPeerId}` : '';
 }
 
 // ── Session lifecycle ─────────────────────────────────────────────────────────
@@ -522,7 +617,14 @@ function createPC(peerId) {
   };
   pc.onconnectionstatechange = () => {
     const p = peers.get(peerId);
-    if (p) { p.state = pc.connectionState; renderPeers(); }
+    if (!p) return;
+    if (pc.connectionState === 'failed') {
+      p.state = 'relay';
+      toast(`Direct connection failed — using server relay for ${peerId.slice(0,8)}…`);
+    } else {
+      p.state = pc.connectionState;
+    }
+    renderPeers();
   };
   return pc;
 }
@@ -564,7 +666,7 @@ async function handleIce(peerId, candidate) {
 // ── Data channel ──────────────────────────────────────────────────────────────
 function setupDC(peerId, dc) {
   dc.binaryType = 'arraybuffer';
-  dc.onopen    = () => { peers.get(peerId).state = 'connected'; renderPeers(); };
+  dc.onopen    = () => { const p = peers.get(peerId); if (p) { p.state = 'connected'; renderPeers(); } };
   dc.onmessage = (e) => handleDCMessage(peerId, e.data);
   dc.onerror   = (e) => console.error('DC error', peerId, e);
 }
@@ -627,6 +729,75 @@ async function sendFilesToPeer(peerId, files) {
   if (t) { t.done = true; renderTransfers(); }
 }
 
+// ── Server-relay file transfer (fallback when WebRTC fails) ──────────────────
+const RELAY_CHUNK_SIZE = 32768;  // 32 KB — safe for base64 in JSON
+
+function arrayBufToB64(buf) {
+  // Loop-based btoa to avoid call-stack overflow on large buffers
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+async function sendFilesToPeerViaRelay(peerId, files) {
+  const fileArr = Array.from(files);
+  const total   = fileArr.reduce((a, f) => a + f.size, 0);
+  const xferId  = `snd-${++xferSeq}`;
+
+  transfers.set(xferId, { dir: 'send', label: fileArr.map(f => f.name).join(', '), total, sent: 0, done: false });
+  renderTransfers();
+  toast(`Sending via server relay…`);
+
+  for (let fi = 0; fi < fileArr.length; fi++) {
+    const file = fileArr[fi];
+    sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'file-start',
+          name: file.name, size: file.size, mimeType: file.type || 'application/octet-stream',
+          fileIndex: fi, totalFiles: fileArr.length });
+
+    const buf = await file.arrayBuffer();
+    let offset = 0;
+    while (offset < buf.byteLength) {
+      const slice = buf.slice(offset, offset + RELAY_CHUNK_SIZE);
+      sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'data', data: arrayBufToB64(slice) });
+      offset += slice.byteLength;
+      const t = transfers.get(xferId);
+      if (t) { t.sent += slice.byteLength; renderTransfers(); }
+      await new Promise(r => setTimeout(r, 5));  // yield to keep WS responsive
+    }
+    sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'file-end', fileIndex: fi });
+  }
+  const t = transfers.get(xferId);
+  if (t) { t.done = true; renderTransfers(); }
+}
+
+function handleRelayChunk(fromId, msg) {
+  const key = `relay-${fromId}`;
+  if (msg.kind === 'file-start') {
+    recvState.set(key, {
+      name: msg.name, size: msg.size,
+      mimeType: msg.mimeType || 'application/octet-stream',
+      chunks: [], received: 0, xferId: msg.xferId,
+    });
+    ensureRecvTransfer(fromId, msg);
+  } else if (msg.kind === 'data') {
+    const r = recvState.get(key);
+    if (!r) return;
+    const raw = atob(msg.data);
+    const arr = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+    r.chunks.push(arr.buffer);
+    r.received += arr.length;
+    updateRecvProgress(r.xferId, r.received / r.size);
+  } else if (msg.kind === 'file-end') {
+    const r = recvState.get(key);
+    if (!r) return;
+    triggerDownload(new Blob(r.chunks, { type: r.mimeType }), r.name);
+    finalizeRecvTransfer(r.xferId);
+    recvState.delete(key);
+  }
+}
+
 // ── File announce ─────────────────────────────────────────────────────────────
 function announceFiles(files) {
   if (peers.size === 0) { toast('No peers in session yet'); return; }
@@ -642,7 +813,16 @@ function handleFileAnnounce(fromId, files) {
 
 function acceptFile(fromId)  { sig({ type: 'file-accept', targetId: fromId }); removeIncoming(fromId); }
 function rejectFile(fromId)  { sig({ type: 'file-reject', targetId: fromId }); removeIncoming(fromId); }
-function handleFileAccepted(fromId) { const f = outgoing.get('__pending__'); if (f) sendFilesToPeer(fromId, f); }
+function handleFileAccepted(fromId) {
+  const f = outgoing.get('__pending__');
+  if (!f) return;
+  const p = peers.get(fromId);
+  if (p?.dc?.readyState === 'open') {
+    sendFilesToPeer(fromId, f);
+  } else {
+    sendFilesToPeerViaRelay(fromId, f);
+  }
+}
 function handleFileRejected(fromId) { toast(`Peer declined the transfer`); }
 
 // ── Folder → zip ──────────────────────────────────────────────────────────────
@@ -710,16 +890,10 @@ async function sendText() {
   if (!text) return;
   if (text.length > MAX_TEXT_LEN) { toast('Text too large'); return; }
   if (peers.size === 0) { toast('No peers connected'); return; }
+  if (!groupKey) { toast('⚠ Session key not ready — re-enter passphrase'); return; }
 
-  // All peers in a session share the same derived session key (same passphrase
-  // + ECDH). Encrypt once with any available key and broadcast via server.
-  const keyEntry = [...sessionKeys.entries()].find(([pid]) => peers.has(pid));
-  if (!keyEntry) {
-    toast('⚠ No key established yet — wait for handshake to complete');
-    return;
-  }
   try {
-    const { ct, iv } = await encryptText(keyEntry[0], text);
+    const { ct, iv } = await encryptWithGroupKey(text);
     sig({ type: 'text-share', ct, iv });
     ta.value = '';
     renderTextShare('me', text);
@@ -730,25 +904,15 @@ async function sendText() {
 }
 
 async function handleTextShare(fromId, ctB64, ivB64) {
-  // Try keys in order: direct peer key, or any available key
-  // (All peers share the same session key in this design)
-  let key = sessionKeys.get(fromId);
-  if (!key) {
-    // Try any available key (same emoji → same key for all peers)
-    for (const [, k] of sessionKeys) { key = k; break; }
-  }
-  if (!key) {
-    toast('⚠ Cannot decrypt — key not yet established');
+  if (!groupKey) {
+    toast('⚠ Cannot decrypt — session key not established');
     return;
   }
   try {
-    // Temporarily set key under fromId for decryption
-    const tempKey = sessionKeys.get(fromId) || [...sessionKeys.values()][0];
-    sessionKeys.set(fromId, tempKey);
-    const plaintext = await decryptText(fromId, ctB64, ivB64);
+    const plaintext = await decryptWithGroupKey(ctB64, ivB64);
     renderTextShare(fromId, plaintext);
   } catch (e) {
-    toast('⚠ Decryption failed — emoji may not match');
+    toast('⚠ Decryption failed — passphrase may not match');
     console.error('Decrypt error', e);
   }
 }
@@ -778,14 +942,18 @@ function showQR() {
   backdrop.innerHTML = `
     <div class="modal">
       <h3>Join this session</h3>
-      <canvas id="qr-canvas"></canvas>
+      <div id="qr-canvas"></div>
       <div class="modal-sub">Open <strong>${location.host}</strong>, find this session, then match the emoji.</div>
       <button class="btn btn-ghost btn-sm mt" onclick="this.closest('.modal-backdrop').remove()">Close</button>
     </div>`;
   document.body.appendChild(backdrop);
   loadQRLib().then(QRC => {
-    QRC.toCanvas(document.getElementById('qr-canvas'), location.href, {
-      width: 200, color: { dark: '#60a5fa', light: '#111827' }
+    new QRC(document.getElementById('qr-canvas'), {
+      text: location.href,
+      width: 200,
+      height: 200,
+      colorDark: '#60a5fa',
+      colorLight: '#111827',
     });
   });
 }
@@ -829,8 +997,11 @@ function renderPeers() {
   }
   list.innerHTML = '';
   for (const [pid, p] of peers) {
-    const col = p.state === 'connected' ? 'var(--green)' : p.state === 'failed' ? 'var(--red)' : 'var(--amber)';
-    const hasKey = sessionKeys.has(pid) ? '🔑' : '⏳';
+    const col = p.state === 'connected' ? 'var(--green)'
+              : p.state === 'relay'     ? 'var(--blue)'
+              : p.state === 'failed'    ? 'var(--red)'
+              : 'var(--amber)';
+    const hasKey = groupKey ? '🔑' : '⏳';
     const el = document.createElement('div');
     el.className = 'peer-item';
     el.innerHTML = `
@@ -1024,7 +1195,7 @@ document.addEventListener('DOMContentLoaded', () => {
     sig({ type: 'leave-session' });
     mySessionId = null; sessionName = null; isCreator = false;
     peers.clear(); transfers.clear(); recvState.clear(); outgoing.clear(); sessionKeys.clear();
-    pendingKeyExchange = null; myECDHPriv = null; myECDHPub = null; myECDHPubHex = null;
+    pendingKeyExchange = null; myECDHPriv = null; myECDHPub = null; myECDHPubHex = null; groupKey = null;
     showView('lobby');
   };
   document.getElementById('btn-show-qr').onclick    = showQR;

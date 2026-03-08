@@ -39,6 +39,7 @@ import logging
 import os
 import secrets
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -162,6 +163,9 @@ class Session:
         # Creator's ephemeral ECDH public key (hex-encoded raw bytes, P-256).
         # Set by 'set-ecdh-pub' after creator picks emoji. Never derivable by server.
         self.creator_pub: str | None = None
+        # All peers' ECDH public keys, keyed by peerId.
+        # Stored so reconnecting peers can re-derive session keys without re-entering passphrase.
+        self.peer_pubs: dict[str, str] = {}
         self.peers:       dict[str, Peer] = {}
         # IPs allowed to remain connected after join window closes
         self.allowed_ips: set[str] = {creator_ip}
@@ -324,6 +328,7 @@ async def handle_message(peer: Peer, msg: dict):
             await send(peer.ws, {"type": "error", "message": "Invalid ECDH public key"})
             return
         session.creator_pub = pub
+        session.peer_pubs[peer.peer_id] = pub
         await send(peer.ws, {"type": "ecdh-pub-set"})
         log.info(f"Session {sid[:8]}… ECDH pub registered, join window open for {JOIN_WINDOW}s")
 
@@ -377,6 +382,7 @@ async def handle_message(peer: Peer, msg: dict):
             return
 
         session.peers[peer.peer_id] = peer
+        session.peer_pubs[peer.peer_id] = joiner_pub
         session.allowed_ips.add(peer.remote_ip)
         peer.session_id = sid
         session.touch()
@@ -400,6 +406,51 @@ async def handle_message(peer: Peer, msg: dict):
     # ── Leave ─────────────────────────────────────────────────────────────────
     elif t == "leave-session":
         await cleanup_peer(peer)
+
+    # ── Rejoin session (after WS reconnect — no passphrase re-entry needed) ──
+    elif t == "rejoin-session":
+        sid     = msg.get("sessionId", "").upper()
+        session = sessions.get(sid)
+        if not session:
+            await send(peer.ws, {"type": "error", "message": "Session not found or expired"})
+            return
+        new_pub = msg.get("ecdhPub", "")
+        if not new_pub or len(new_pub) > 512:
+            await send(peer.ws, {"type": "error", "message": "Missing ECDH public key"})
+            return
+
+        # Allow rejoin if the IP was previously seen, OR the ECDH pub was previously
+        # registered (handles IP changes on mobile / different-network clients).
+        known_ip  = peer.remote_ip in session.allowed_ips
+        known_pub = new_pub in session.peer_pubs.values()
+        if not known_ip and not known_pub:
+            await send(peer.ws, {"type": "error", "message": "Not authorised to rejoin this session"})
+            return
+
+        session.peers[peer.peer_id] = peer
+        session.peer_pubs[peer.peer_id] = new_pub
+        session.allowed_ips.add(peer.remote_ip)  # register new IP if it changed
+        peer.session_id = sid
+        session.touch()
+
+        existing  = [pid for pid in session.peers if pid != peer.peer_id]
+        peer_pubs = {pid: session.peer_pubs.get(pid, "") for pid in existing}
+
+        await send(peer.ws, {
+            "type":      "session-rejoined",
+            "sessionId": sid,
+            "name":      session.name,
+            "peerId":    peer.peer_id,
+            "peers":     existing,
+            "peerPubs":  peer_pubs,
+        })
+        # Notify existing peers so they can re-derive the key and re-establish WebRTC
+        await broadcast(session, {
+            "type":    "peer-joined",
+            "peerId":  peer.peer_id,
+            "ecdhPub": new_pub,
+        }, exclude_id=peer.peer_id)
+        log.info(f"Peer {peer.peer_id[:8]}… rejoined {sid[:8]}… from {peer.remote_ip}")
 
     # ── WebRTC signaling — relayed verbatim ───────────────────────────────────
     elif t in ("offer", "answer", "ice-candidate"):
@@ -430,6 +481,21 @@ async def handle_message(peer: Peer, msg: dict):
         session = sessions.get(sid) if sid else None
         if session:
             await relay_to(session, {"type": t, "fromId": peer.peer_id}, msg.get("targetId", ""))
+
+    # ── File relay — chunks forwarded verbatim when WebRTC is unavailable ────
+    elif t == "relay-chunk":
+        sid     = peer.session_id
+        session = sessions.get(sid) if sid else None
+        if not session:
+            return
+        session.touch()
+        target_id = msg.get("targetId")
+        if not target_id:
+            return
+        # Forward everything except targetId; add fromId so receiver knows the sender
+        relay_msg = {k: v for k, v in msg.items() if k != "targetId"}
+        relay_msg["fromId"] = peer.peer_id
+        await relay_to(session, relay_msg, target_id)
 
     # ── Text share — relayed as opaque AES-GCM ciphertext ────────────────────
     elif t == "text-share":
@@ -486,6 +552,71 @@ def create_app() -> web.Application:
         asyncio.ensure_future(cleanup_task())
     app.on_startup.append(start_cleanup)
     return app
+
+# ── TURN connectivity check ───────────────────────────────────────────────────
+def _parse_turn_host_port(url: str) -> tuple[str, int]:
+    """Parse 'turn:host:port', 'turns:host:port', or 'turn:host' → (host, port)."""
+    rest = url.split(":", 1)[1].lstrip("/").split("?")[0]
+    if ":" in rest:
+        host, port_str = rest.rsplit(":", 1)
+        return host, int(port_str)
+    default_port = 5349 if url.lower().startswith("turns:") else 3478
+    return rest, default_port
+
+def check_turn_connectivity() -> None:
+    """
+    Verify the configured TURN server is reachable.
+
+    Checks performed:
+      1. If TURN_URL is not set, logs a warning (relay disabled).
+      2. If coturn is installed locally, checks whether the systemd service is active.
+      3. Attempts a TCP connection to the TURN host:port with a 5-second timeout.
+         A successful connection confirms the port is open and the process is listening.
+         (Note: this verifies TCP reachability only; UDP relay ports are not tested here.)
+    """
+    if not TURN_URL:
+        log.warning(
+            "TURN not configured — peers on different networks may not be able to connect. "
+            "Run with sudo to auto-install coturn, or set TURN_URL in .env."
+        )
+        return
+
+    try:
+        host, port = _parse_turn_host_port(TURN_URL)
+    except Exception as e:
+        log.warning(f"Could not parse TURN_URL {TURN_URL!r}: {e}")
+        return
+
+    # ── Local coturn service check ─────────────────────────────────────────────
+    if shutil.which("turnserver"):
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", "coturn"],
+                capture_output=True, text=True, timeout=3,
+            )
+            status = result.stdout.strip()
+            if status == "active":
+                log.info("coturn service: active")
+            else:
+                log.warning(
+                    f"coturn service is not active (systemctl status: {status!r}). "
+                    "File relay will fail. Try: sudo systemctl start coturn"
+                )
+        except Exception:
+            pass  # systemctl unavailable or timed out
+
+    # ── TCP reachability probe ─────────────────────────────────────────────────
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            log.info(f"TURN server reachable: {host}:{port} (TCP)")
+    except OSError as e:
+        log.warning(
+            f"TURN server NOT reachable at {host}:{port} (TCP): {e}\n"
+            f"  Ensure the following ports are open in your firewall / Azure NSG:\n"
+            f"    3478       UDP + TCP   STUN / TURN\n"
+            f"    5349       UDP + TCP   TURNS (TURN over TLS)\n"
+            f"    49152-65535 UDP        TURN relay media ports"
+        )
 
 # ── coturn setup ──────────────────────────────────────────────────────────────
 def check_or_install_coturn():
@@ -684,6 +815,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-ssl", action="store_true", help="Disable TLS (not recommended)")
     args = parser.parse_args()
     check_or_install_coturn()
+    check_turn_connectivity()
     ssl_ctx = None if args.no_ssl else make_ssl_context()
     proto   = "https" if ssl_ctx else "http"
     log.info(f"FileDrop on {proto}://{args.host}:{args.port}  TTL={SESSION_TTL}s  window={JOIN_WINDOW}s  TURN={'yes' if TURN_URL else 'no'}")
