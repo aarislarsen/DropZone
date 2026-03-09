@@ -175,9 +175,11 @@ EOF
 Restart the DropZone server. The startup log will show TURN=yes, and the ICE server list sent to browsers will include time-limited TURN credentials — enough  for WebRTC to relay through your server when direct P2P fails.
 
 The following ports must be allowed:
+```
 TCP + UDP 3478 (STUN/TURN)
 TCP + UDP 5349 (TURN over TLS)
 49152-65535 UDP (TURN relay media ports)
+```
 
 ---
 
