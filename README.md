@@ -1,5 +1,8 @@
 # DropZone
 
+
+![image info](image.png)
+
 Browser-based peer-to-peer file transfer and encrypted text sharing. Files travel directly between browsers over WebRTC — the server only brokers the connection. Text messages are end-to-end encrypted with AES-256-GCM and never leave the browser as plaintext.
 
 ---
