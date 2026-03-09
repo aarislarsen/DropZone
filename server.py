@@ -596,9 +596,14 @@ async def cleanup_peer(peer: Peer):
 # ── Singleplayer middleware ───────────────────────────────────────────────────
 @web.middleware
 async def singleplayer_guard(request: web.Request, handler):
-    """Block requests from IPs not in server_allowed_ips once the server is locked."""
+    """
+    Block requests from IPs not in server_allowed_ips once the server is locked,
+    unless a join window is currently open (in which case the page must remain
+    accessible so new peers can connect and join).
+    """
     if server_locked and get_remote_ip(request) not in server_allowed_ips:
-        raise web.HTTPForbidden(reason="Server locked")
+        if not any(s.join_window_open() for s in sessions.values()):
+            raise web.HTTPForbidden(reason="Server locked")
     return await handler(request)
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -958,7 +963,6 @@ if __name__ == "__main__":
         SESSION_TTL = args.session_ttl
 
     if args.singleplayer:
-        global SINGLEPLAYER
         SINGLEPLAYER = True
 
     if (args.ssl_cert is None) != (args.ssl_key is None):

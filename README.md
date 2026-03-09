@@ -50,7 +50,7 @@ Open `https://<your-host>:8080` in a browser. Accept the self-signed certificate
 | `--port` | `8080` | TCP port |
 | `--join-window` | `60` | Seconds the join window stays open after a session is created |
 | `--session-ttl` | `3600` | Seconds of inactivity before a session expires |
-| `--singleplayer` | off | Once the join window closes, block all IPs that did not participate from accessing the server |
+| `--singleplayer` | off | Once the join window closes, block all IPs that did not join from accessing the server. The page remains open to everyone while a join window is active (including reopened windows). |
 | `--ssl-cert` | auto-generated | Path to a PEM certificate file |
 | `--ssl-key` | auto-generated | Path to a PEM private key file (required with `--ssl-cert`) |
 | `--no-ssl` | — | Disable TLS (Web Crypto API will not work in browsers over plain HTTP) |
