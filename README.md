@@ -124,8 +124,49 @@ WebRTC requires a TURN server when peers are on different networks behind strict
 
 If `coturn` is installed on the server host, DropZone will check whether it is running at startup and report its status in the log.
 
-Set `TURN_URL`, `TURN_SECRET`, and `TURN_REALM` in `.env` to enable TURN.
+Set `TURN_URL`, `TURN_SECRET`, and `TURN_REALM` in `.env` to enable TURN. Or configure as follows:
 
+```
+sudo apt-get install -y coturn
+
+Generate a strong secret:
+openssl rand -hex 32
+# e.g.: a3f8c2d1e4b5...  — copy this value
+
+Create the config:
+sudo tee /etc/turnserver.conf > /dev/null <<'EOF'
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+lt-cred-mech
+use-auth-secret
+static-auth-secret=REPLACE_WITH_YOUR_SECRET
+realm=74.234.178.33
+no-multicast-peers
+no-cli
+min-port=49152
+max-port=65535
+EOF
+
+Enable and start coturn:
+sudo sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
+sudo systemctl enable coturn
+sudo systemctl start coturn
+
+Configure DropZone — create a .env file next to server.py:
+cat > ~/DropZone/.env <<'EOF'
+TURN_URL=turn:74.234.178.33:3478
+TURN_SECRET=REPLACE_WITH_YOUR_SECRET
+TURN_REALM=74.234.178.33
+EOF
+```
+
+Restart the FileDrop server. The startup log will show TURN=yes, and the ICE server list sent to browsers will include time-limited TURN credentials — enough  for WebRTC to relay through your server when direct P2P fails.
+
+The following ports must be allowed:
+TCP + UDP 3478 (STUN/TURN)
+TCP + UDP 5349 (TURN over TLS)
+49152-65535 UDP (TURN relay media ports)
 ---
 
 ## Security notes
