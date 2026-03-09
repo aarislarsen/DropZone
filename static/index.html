@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DropZone</title>
-  <link rel="stylesheet" href="/style.css?v=6">
+  <link rel="stylesheet" href="/style.css?v=7">
 </head>
 <body>
 
@@ -168,9 +168,16 @@
       </div>
       <div class="panel-body">
         <div class="dropzone" id="dropzone">
-          <span class="dropzone-icon">📂</span>
-          <div>drop files or folders here</div>
-          <div class="dropzone-sub">or click to select &nbsp;·&nbsp; folders zipped automatically</div>
+          <svg class="drop-ring-svg" viewBox="0 0 220 220" aria-hidden="true">
+            <circle class="drop-ring-track"    cx="110" cy="110" r="104"/>
+            <circle class="drop-ring-progress" cx="110" cy="110" r="104"
+                    id="drop-ring-progress" transform="rotate(180 110 110)"/>
+          </svg>
+          <div class="dropzone-content">
+            <span class="dropzone-icon">📂</span>
+            <div>drop files here</div>
+            <div class="dropzone-sub">click to select<br>folders zipped automatically</div>
+          </div>
         </div>
         <input type="file" id="file-input" multiple style="display:none">
       </div>
@@ -218,6 +225,6 @@
 </div>
 
 <div class="toast-wrap" id="toasts"></div>
-<script src="/app.js?v=6"></script>
+<script src="/app.js?v=7"></script>
 </body>
 </html>

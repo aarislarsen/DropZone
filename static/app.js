@@ -37,6 +37,7 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CHUNK_SIZE       = 65536;
+const DROP_RING_CIRC   = 2 * Math.PI * 104;  // circumference for r=104 ring
 const DC_BUFFER_LIMIT  = 4_194_304;
 const MAX_TEXT_LEN     = 100_000;
 const PBKDF2_ITERS     = 200_000;
@@ -861,9 +862,24 @@ function finalizeRecvTransfer(xferId) {
   if (t) { t.done = true; t.ratio = 1; renderTransfers(); }
 }
 
+function updateDropRing() {
+  const el = document.getElementById('drop-ring-progress');
+  if (!el) return;
+  // Find the most recent outgoing transfer and use its progress
+  let ratio = 0;
+  for (const [, t] of [...transfers].reverse()) {
+    if (t.dir === 'send') {
+      ratio = t.done ? 1 : (t.total > 0 ? t.sent / t.total : 0);
+      break;
+    }
+  }
+  el.style.strokeDashoffset = DROP_RING_CIRC * (1 - ratio);
+}
+
 function renderTransfers() {
   const panel = document.getElementById('transfers-panel');
   const list  = document.getElementById('transfers-list');
+  updateDropRing();
   if (!transfers.size) { panel.classList.add('hidden'); return; }
   panel.classList.remove('hidden');
   list.innerHTML = '';

@@ -259,24 +259,65 @@ input::placeholder, textarea::placeholder { color: var(--text3); }
 }
 
 .dropzone {
-  border: 1px dashed var(--border2);
-  border-radius: var(--radius);
-  padding: 2rem 1.5rem;
-  text-align: center;
+  position: relative;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
-  transition: all 0.12s;
-  font-size: 0.78rem;
+  transition: background 0.18s;
+}
+.dropzone:hover          { background: var(--accent-lo); }
+.dropzone.drag-over      { background: rgba(74,158,255,.08); }
+.dropzone.disabled       { opacity: 0.3; pointer-events: none; }
+
+.drop-ring-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.drop-ring-track {
+  fill: none;
+  stroke: var(--border2);
+  stroke-width: 4;
+  transition: stroke 0.2s, filter 0.2s;
+}
+.dropzone:hover .drop-ring-track {
+  stroke: var(--accent);
+  filter: drop-shadow(0 0 5px var(--accent-glow));
+}
+.dropzone.drag-over .drop-ring-track {
+  stroke: var(--blue);
+  filter: drop-shadow(0 0 7px rgba(74,158,255,.5));
+}
+.drop-ring-progress {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-dasharray: 653.5;
+  stroke-dashoffset: 653.5;
+  transition: stroke-dashoffset 0.12s linear;
+}
+
+.dropzone-content {
+  position: relative;
+  text-align: center;
+  font-size: 0.75rem;
   color: var(--text2);
+  pointer-events: none;
+  line-height: 1.55;
 }
-.dropzone:hover, .dropzone.drag-over {
-  border-color: var(--accent);
-  background: var(--accent-lo);
-  color: var(--accent);
-}
-.dropzone.drag-over { background: rgba(0,217,126,.11); }
-.dropzone.disabled  { opacity: 0.3; pointer-events: none; }
-.dropzone-icon { font-size: 1.4rem; margin-bottom: 0.45rem; display: block; }
-.dropzone-sub  { font-size: 0.68rem; color: var(--text3); margin-top: 0.3rem; letter-spacing: 0.04em; }
+.dropzone:hover .dropzone-content,
+.dropzone.drag-over .dropzone-content { color: var(--accent); }
+.dropzone-icon { font-size: 1.6rem; margin-bottom: 0.4rem; display: block; }
+.dropzone-sub  { font-size: 0.6rem; color: var(--text3); margin-top: 0.25rem; letter-spacing: 0.03em; line-height: 1.6; }
 
 .transfer-card {
   background: var(--bg2);
