@@ -49,6 +49,8 @@ Open `https://<your-host>:8080` in a browser. Accept the self-signed certificate
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8080` | TCP port |
 | `--join-window` | `60` | Seconds the join window stays open after a session is created |
+| `--session-ttl` | `3600` | Seconds of inactivity before a session expires |
+| `--singleplayer` | off | Once the join window closes, block all IPs that did not participate from accessing the server |
 | `--ssl-cert` | auto-generated | Path to a PEM certificate file |
 | `--ssl-key` | auto-generated | Path to a PEM private key file (required with `--ssl-cert`) |
 | `--no-ssl` | — | Disable TLS (Web Crypto API will not work in browsers over plain HTTP) |
@@ -61,6 +63,12 @@ python3 server.py --port 443
 
 # Longer join window
 python3 server.py --join-window 300
+
+# Shorter session timeout (10 minutes)
+python3 server.py --session-ttl 600
+
+# Private session — only participants from the join window can access the server
+python3 server.py --singleplayer
 
 # Use an existing certificate (e.g. from Let's Encrypt)
 python3 server.py --ssl-cert /etc/letsencrypt/live/example.com/fullchain.pem \
@@ -75,7 +83,7 @@ All options can also be set in a `.env` file in the same directory as `server.py
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8080` | TCP port |
-| `SESSION_TTL` | `600` | Seconds of inactivity before a session is removed |
+| `SESSION_TTL` | `3600` | Seconds of inactivity before a session is removed |
 | `JOIN_WINDOW` | `60` | Seconds the join window stays open |
 | `TURN_URL` | — | TURN server URL (e.g. `turns:example.com:5349`) |
 | `TURN_SECRET` | — | TURN static auth secret |

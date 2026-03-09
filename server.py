@@ -68,6 +68,14 @@ logging.basicConfig(
 log = logging.getLogger("filedrop")
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
+class _IgnoreBadHttpMessage(logging.Filter):
+    """Drop the noisy 'Pause on PRI/Upgrade' errors from HTTP/2 scanner probes."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "BadHttpMessage" not in str(record.exc_info) and \
+               "Pause on PRI/Upgrade" not in record.getMessage()
+
+logging.getLogger("aiohttp.server").addFilter(_IgnoreBadHttpMessage())
+
 # ── Config ────────────────────────────────────────────────────────────────────
 def load_env():
     env_path = Path(__file__).parent / ".env"
@@ -82,11 +90,18 @@ load_env()
 
 HOST        = os.environ.get("HOST", "0.0.0.0")
 PORT        = int(os.environ.get("PORT", "8080"))
-SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "3600"))
 JOIN_WINDOW = int(os.environ.get("JOIN_WINDOW", "60"))
 TURN_URL    = os.environ.get("TURN_URL", "")
 TURN_SECRET = os.environ.get("TURN_SECRET", "")
 TURN_REALM  = os.environ.get("TURN_REALM", "")
+SINGLEPLAYER = False  # Set by --singleplayer CLI flag
+
+# ── Singleplayer server-level IP lock ─────────────────────────────────────────
+# When SINGLEPLAYER is True, these are populated as session join windows close.
+# Once server_locked is True, any IP not in server_allowed_ips gets a 403.
+server_locked:      bool      = False
+server_allowed_ips: set[str]  = set()
 
 # ── Session name generation ───────────────────────────────────────────────────
 # 50 × 50 = 2,500 human-readable names. Session identity is a 128-bit random ID.
@@ -236,6 +251,7 @@ async def cleanup_task():
     1. Lock sessions whose join window has elapsed.
     2. Disconnect peers from locked sessions whose IPs are not in the allowlist.
     3. Expire idle sessions.
+    4. In --singleplayer mode, lock the whole server once the first join window closes.
     """
     while True:
         await asyncio.sleep(30)
@@ -256,6 +272,18 @@ async def cleanup_task():
                     if peer.remote_ip not in session.allowed_ips:
                         await send(peer.ws, {"type": "error", "message": "Access denied"})
                         await peer.ws.close()
+
+                # In singleplayer mode, add this session's IPs to the server-wide
+                # allowlist and lock the server to all other IPs.
+                if SINGLEPLAYER:
+                    global server_locked, server_allowed_ips
+                    server_allowed_ips |= session.allowed_ips
+                    if not server_locked:
+                        server_locked = True
+                        log.info(
+                            f"[singleplayer] Server locked — "
+                            f"allowed IPs: {server_allowed_ips}"
+                        )
 
             # Expire idle sessions
             if session.is_expired():
@@ -565,6 +593,14 @@ async def cleanup_peer(peer: Peer):
     else:
         log.info(f"Peer {peer.peer_id[:8]}… left {sid[:8]}…")
 
+# ── Singleplayer middleware ───────────────────────────────────────────────────
+@web.middleware
+async def singleplayer_guard(request: web.Request, handler):
+    """Block requests from IPs not in server_allowed_ips once the server is locked."""
+    if server_locked and get_remote_ip(request) not in server_allowed_ips:
+        raise web.HTTPForbidden(reason="Server locked")
+    return await handler(request)
+
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 async def index_handler(request: web.Request) -> web.Response:
     return web.FileResponse(Path(__file__).parent / "static" / "index.html")
@@ -601,7 +637,8 @@ async def _on_shutdown(app: web.Application) -> None:
     log.info("DropZone stopped.")
 
 def create_app() -> web.Application:
-    app = web.Application()
+    middlewares = [singleplayer_guard] if SINGLEPLAYER else []
+    app = web.Application(middlewares=middlewares)
     static_dir = Path(__file__).parent / "static"
     app.router.add_get("/ws",  ws_handler)
     app.router.add_get("/",    index_handler)
@@ -899,19 +936,30 @@ if __name__ == "__main__":
                         help="Bind address")
     parser.add_argument("--port",        type=int, default=PORT, metavar="PORT",
                         help="TCP port to listen on")
-    parser.add_argument("--join-window", type=int, default=None, metavar="SECS",
+    parser.add_argument("--join-window",  type=int, default=None, metavar="SECS",
                         help=f"Seconds the join window stays open after session creation (env default: {JOIN_WINDOW})")
+    parser.add_argument("--session-ttl", type=int, default=None, metavar="SECS",
+                        help=f"Seconds of inactivity before a session expires (env default: {SESSION_TTL})")
     parser.add_argument("--no-ssl",      action="store_true",
                         help="Disable TLS (not recommended — Web Crypto requires HTTPS)")
     parser.add_argument("--ssl-cert",    default=None, metavar="PATH",
                         help="Path to PEM certificate file (default: auto-generate filedrop-cert.pem)")
     parser.add_argument("--ssl-key",     default=None, metavar="PATH",
                         help="Path to PEM private key file (default: auto-generate filedrop-key.pem)")
+    parser.add_argument("--singleplayer", action="store_true",
+                        help="Lock the entire server to join-window participants once the window closes")
     args = parser.parse_args()
 
     # ── CLI overrides ──────────────────────────────────────────────────────────
     if args.join_window is not None:
         JOIN_WINDOW = args.join_window
+
+    if args.session_ttl is not None:
+        SESSION_TTL = args.session_ttl
+
+    if args.singleplayer:
+        global SINGLEPLAYER
+        SINGLEPLAYER = True
 
     if (args.ssl_cert is None) != (args.ssl_key is None):
         parser.error("--ssl-cert and --ssl-key must be used together")
@@ -930,7 +978,9 @@ if __name__ == "__main__":
     proto = "https" if ssl_ctx else "http"
     log.info(
         f"DropZone on {proto}://{args.host}:{args.port}  "
-        f"TTL={SESSION_TTL}s  window={JOIN_WINDOW}s  TURN={'yes' if TURN_URL else 'no'}"
+        f"TTL={SESSION_TTL}s  window={JOIN_WINDOW}s  "
+        f"TURN={'yes' if TURN_URL else 'no'}  "
+        f"singleplayer={'yes' if SINGLEPLAYER else 'no'}"
     )
     if ssl_ctx is None and not args.no_ssl:
         log.warning("Running without TLS — Web Crypto API will be unavailable in browsers")
