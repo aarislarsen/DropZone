@@ -27,7 +27,10 @@ Env vars (or .env file) — CLI flags take precedence when both are set:
     TRUSTED_PROXY     1          set if behind nginx/caddy to respect X-Forwarded-For
 
 Security model:
-    - File bytes never touch the server; only WebRTC signaling is relayed.
+    - File bytes never touch the server in readable form. On the WebRTC path,
+      files travel over DTLS-secured DataChannels. On the relay fallback path,
+      each chunk is encrypted client-side with AES-256-GCM (groupKey) before
+      transmission; the server relays opaque ciphertext and cannot read file contents.
     - Text-share messages are relayed as AES-GCM ciphertext. The server sees only
       opaque base64 blobs and cannot read plaintext.
     - The emoji sequence is chosen by the creator client-side and never sent to

@@ -192,7 +192,7 @@ async function dispatch(msg) {
       break;
 
     case 'relay-chunk':
-      handleRelayChunk(msg.fromId, msg);
+      await handleRelayChunk(msg.fromId, msg);
       break;
 
     case 'text-share':
@@ -580,47 +580,69 @@ async function sendFilesToPeerViaRelay(peerId, files) {
   renderTransfers();
   toast(`Sending via server relay…`);
 
+  // All relay payloads are encrypted with the group key so the server sees only
+  // opaque ciphertext. Each message is a JSON envelope { kind, ...fields }.
+  async function relayEncrypted(payload) {
+    const { ct, iv } = await encryptWithGroupKey(JSON.stringify(payload));
+    sig({ type: 'relay-chunk', targetId: peerId, ct, iv });
+  }
+
   for (let fi = 0; fi < fileArr.length; fi++) {
     const file = fileArr[fi];
-    sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'file-start',
-          name: file.name, size: file.size, mimeType: file.type || 'application/octet-stream',
-          fileIndex: fi, totalFiles: fileArr.length });
+    await relayEncrypted({
+      kind: 'file-start', name: file.name, size: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      fileIndex: fi, totalFiles: fileArr.length,
+    });
 
     const buf = await file.arrayBuffer();
     let offset = 0;
     while (offset < buf.byteLength) {
       const slice = buf.slice(offset, offset + RELAY_CHUNK_SIZE);
-      sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'data', data: bytesToB64(slice) });
+      await relayEncrypted({ kind: 'data', data: bytesToB64(slice) });
       offset += slice.byteLength;
       const t = transfers.get(xferId);
       if (t) { t.sent += slice.byteLength; renderTransfers(); }
       await new Promise(r => setTimeout(r, 5));  // yield to keep WS responsive
     }
-    sig({ type: 'relay-chunk', targetId: peerId, xferId, kind: 'file-end', fileIndex: fi });
+    await relayEncrypted({ kind: 'file-end', fileIndex: fi });
   }
   const t = transfers.get(xferId);
   if (t) { t.done = true; renderTransfers(); }
 }
 
-function handleRelayChunk(fromId, msg) {
+async function handleRelayChunk(fromId, msg) {
+  if (!groupKey) {
+    toast('⚠ Cannot decrypt relay chunk — session key not established');
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(await decryptWithGroupKey(msg.ct, msg.iv));
+  } catch (e) {
+    console.error('relay-chunk decrypt failed', e);
+    toast('⚠ Relay chunk decryption failed — passphrase may not match');
+    return;
+  }
+
   const key = `relay-${fromId}`;
-  if (msg.kind === 'file-start') {
+  if (payload.kind === 'file-start') {
     recvState.set(key, {
-      name: msg.name, size: msg.size,
-      mimeType: msg.mimeType || 'application/octet-stream',
+      name: payload.name, size: payload.size,
+      mimeType: payload.mimeType || 'application/octet-stream',
       chunks: [], received: 0,
     });
-    ensureRecvTransfer(key, msg);
-  } else if (msg.kind === 'data') {
+    ensureRecvTransfer(key, payload);
+  } else if (payload.kind === 'data') {
     const r = recvState.get(key);
     if (!r) return;
-    const raw = atob(msg.data);
+    const raw = atob(payload.data);
     const arr = new Uint8Array(raw.length);
     for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
     r.chunks.push(arr.buffer);
     r.received += arr.length;
     updateRecvProgress(r.xferId, r.received / r.size);
-  } else if (msg.kind === 'file-end') {
+  } else if (payload.kind === 'file-end') {
     const r = recvState.get(key);
     if (!r) return;
     triggerDownload(new Blob(r.chunks, { type: r.mimeType }), r.name);
@@ -709,7 +731,7 @@ function loadJSZip() {
   if (_jszip) return Promise.resolve(new _jszip());
   return new Promise((resolve, reject) => {
     const s   = document.createElement('script');
-    s.src     = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    s.src     = '/jszip.min.js';
     s.onload  = () => { _jszip = JSZip; resolve(new JSZip()); };
     s.onerror = reject;
     document.head.appendChild(s);
@@ -793,7 +815,7 @@ function loadQRLib() {
   return new Promise((resolve, reject) => {
     if (window.QRCode) return resolve(window.QRCode);
     const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+    s.src = '/qrcode.min.js';
     s.onload  = () => resolve(window.QRCode);
     s.onerror = reject;
     document.head.appendChild(s);
