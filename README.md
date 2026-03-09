@@ -3,14 +3,14 @@
 
 ![image info](image.png)
 
-Browser-based peer-to-peer file transfer and encrypted text sharing. Files travel directly between browsers over WebRTC — the server only brokers the connection. Text messages are end-to-end encrypted with AES-256-GCM and never leave the browser as plaintext.
+Browser-based peer-to-peer file transfer and encrypted text sharing. Files travel directly between browsers over WebRTC — the server only brokers the connection. When a direct connection is not possible, files are relayed through the server as AES-256-GCM ciphertext; the server cannot read them. Text messages are end-to-end encrypted with AES-256-GCM and never leave the browser as plaintext.
 
 ---
 
 ## What it does
 
 - **Files go peer-to-peer.** Once two peers connect, the server is not involved in the transfer. Files are sent over a DTLS-encrypted WebRTC data channel.
-- **Server relay fallback.** If a direct WebRTC connection cannot be established (e.g. strict NAT), file chunks are relayed through the server as a fallback.
+- **Server relay fallback.** If a direct WebRTC connection cannot be established (e.g. strict NAT), file chunks are encrypted with AES-256-GCM (using the same passphrase-derived session key) and relayed through the server. The server sees only opaque ciphertext and cannot read file contents on either path.
 - **Text is end-to-end encrypted.** Messages are encrypted in the browser with AES-256-GCM before being relayed. The server sees only opaque ciphertext.
 - **Passphrase-derived session key.** All peers in a session enter the same passphrase. The session key is derived locally via PBKDF2 + HKDF and is never transmitted.
 - **No accounts, no storage.** Sessions are ephemeral and exist only in memory. Nothing is written to disk.
@@ -131,7 +131,7 @@ If the 60-second join window has closed, the session creator can click **↺ reo
 
 ## TURN server (cross-network transfers)
 
-WebRTC requires a TURN server when peers are on different networks behind strict NAT. Without one, the server relay fallback is used for files instead.
+WebRTC requires a TURN server when peers are on different networks behind strict NAT. Without one, DropZone falls back to relaying encrypted file chunks through the signaling server. TURN is still recommended — it keeps file data off the signaling server entirely and typically gives better throughput.
 
 If `coturn` is installed on the server host, DropZone will check whether it is running at startup and report its status in the log.
 
@@ -172,7 +172,7 @@ TURN_REALM=74.234.178.33
 EOF
 ```
 
-Restart the FileDrop server. The startup log will show TURN=yes, and the ICE server list sent to browsers will include time-limited TURN credentials — enough  for WebRTC to relay through your server when direct P2P fails.
+Restart the DropZone server. The startup log will show TURN=yes, and the ICE server list sent to browsers will include time-limited TURN credentials — enough  for WebRTC to relay through your server when direct P2P fails.
 
 The following ports must be allowed:
 TCP + UDP 3478 (STUN/TURN)
@@ -186,5 +186,5 @@ TCP + UDP 5349 (TURN over TLS)
 - **The passphrase is never sent to the server.** The server stores only a random salt and an opaque session token per peer.
 - **The session key never leaves the browser.** It is derived locally from the passphrase using PBKDF2-SHA256 (200,000 iterations) and HKDF-SHA256.
 - **Text messages are relayed as ciphertext.** The server cannot read them.
-- **Files are sent peer-to-peer** over DTLS-encrypted WebRTC data channels. When the relay fallback is used, file chunks pass through the server unencrypted — use the direct WebRTC path for sensitive files.
+- **Files are end-to-end encrypted on both paths.** Over WebRTC, files travel over DTLS-encrypted data channels. Over the relay fallback, each chunk is encrypted client-side with AES-256-GCM (the passphrase-derived session key) before transmission. The server cannot read file contents on either path.
 - **HTTPS is required.** The Web Crypto API is only available in secure contexts.
