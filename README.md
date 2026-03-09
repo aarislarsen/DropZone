@@ -167,6 +167,7 @@ The following ports must be allowed:
 TCP + UDP 3478 (STUN/TURN)
 TCP + UDP 5349 (TURN over TLS)
 49152-65535 UDP (TURN relay media ports)
+
 ---
 
 ## Security notes
